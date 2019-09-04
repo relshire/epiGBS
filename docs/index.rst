@@ -4,7 +4,7 @@
    contain the root `toctree` directive.
 
 Python scripts for analysis of epiGBS data
-==================================
+==========================================
 :Author: Thomas van Gurp, Björn Wouters and Contributors
 :Date: |today|
 :Version: |version|
@@ -18,9 +18,18 @@ The modules are mostly wrapper scripts of existing software, dependencies are li
 Contents:
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 3
 
+The epiGBS pipeline consists of the following steps:
 
+1. Demultiplexing
+=================
+.. automodule:: demultiplex
+   :members:
+
+2. Mapping and variant calling
+==============================
+.. automodule:: mapping_variant_calling
 
 Indices and tables
 ==================

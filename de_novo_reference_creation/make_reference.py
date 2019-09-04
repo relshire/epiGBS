@@ -11,8 +11,12 @@ import subprocess
 import tempfile
 import os
 import operator
+import copy
+import unittest
 import gzip
 
+#unittest for robust modules, for in installation mode help to create robust function
+#integration testing
 origWD = os.getcwd()
 os.chdir(origWD)
 
@@ -29,7 +33,6 @@ usearch = "usearch"#_8.0.1409_i86osx32"
 vsearch = "vsearch"
 seqtk = "seqtk"
 pear = "pear"
-mergeBSv3 = "mergeBSv3.py"
 create_consensus = "create_consensus.py"
 vcfutils = "vcfutils.pl"
 
@@ -39,10 +42,14 @@ def parse_args():
     #input files
     parser.add_argument('-s','--sequences',
                         help='number of sequences to take for testing, useful for debugging')
-    parser.add_argument('--forward',
+    parser.add_argument('--forward',required=True,
                         help='forward reads fastq')
-    parser.add_argument('--reverse',
+    parser.add_argument('--reverse',required=True,
                     help='reverse reads fastq')
+    parser.add_argument('--barcodes',
+                        help='max barcode length used to trim joined reads')
+    parser.add_argument('--cycles',required=True,
+                        help='Number of sequencing cycles / read length')
     parser.add_argument('--min_unique_size',default="2",
                     help='Minimum unique cluster size')
     parser.add_argument('--clustering_treshold',default="0.95",
@@ -72,6 +79,15 @@ def parse_args():
         args.samout = os.path.join(args.outputdir,'clustering.bam')
         args.consensus = os.path.join(args.outputdir,'consensus.fa')
         args.consensus_cluster = os.path.join(args.outputdir,'consensus_cluster.fa')
+    assert os.path.exists(args.barcodes)
+    try:
+        assert os.path.exists(args.forward)
+    except AssertionError:
+        raise AssertionError("%s does not exist" % args.forward)
+    try:
+        assert os.path.exists(args.reverse)
+    except AssertionError:
+        raise AssertionError("%s does not exist" % args.reverse)
     return args
 
 def run_subprocess(cmd,args,log_message):
@@ -85,16 +101,12 @@ def run_subprocess(cmd,args,log_message):
         log.flush()
         p = subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,shell=True,executable='bash')
         stdout, stderr = p.communicate()
-        stdout = stdout.replace('\r','\n')
-        stderr = stderr.replace('\r','\n')
-        # stderr = None
+        stdout = stdout.decode().replace('\r','\n')
+        stderr = stderr.decode().replace('\r','\n')
         if stdout:
             log.write('stdout:\n%s\n'%stdout)
         if stderr:
             log.write('stderr:\n%s\n'%stderr)
-        # return_code = p.poll()
-        # if return_code:
-        #     raise RuntimeError(stderr)
         log.write('finished:\t%s\n\n'%log_message)
     return 0
 
@@ -111,17 +123,17 @@ def merge_reads(args):
         else:
             head = ''
         if args.forward.endswith('.gz'):
-            cat = 'pigz -cd '
+            cat = 'pigz -p %s -cd '%args.threads
         else:
             cat = 'cat '
         if strand == 'watson':
             grep_watson = "|grep 'Watson\|watson' -A 3 |sed '/^--$/d'"
-            cmd1 = [ cat + args.forward + head + grep_watson + '|pigz -c >'+fwd_out.name]
-            cmd2 = [ cat  + args.reverse + head + grep_watson + '|pigz -c >'+rev_out.name]
+            cmd1 = [ cat + args.forward + head + grep_watson + '|pigz -p %s -c >'%(args.threads)+fwd_out.name]
+            cmd2 = [ cat  + args.reverse + head + grep_watson + '|pigz -p %s -c >'%(args.threads)+rev_out.name]
         else:
             grep_crick = "|grep 'Crick\|crick' -A 3 |sed '/^--$/d'"
-            cmd1 = [cat + args.forward + head + grep_crick + '|pigz -c  >'+fwd_out.name]
-            cmd2 = [cat + args.reverse + head + grep_crick + '|pigz -c  >'+rev_out.name]
+            cmd1 = [cat + args.forward + head + grep_crick + '|pigz -p %s -c  >'%(args.threads)+fwd_out.name]
+            cmd2 = [cat + args.reverse + head + grep_crick + '|pigz -p %s -c  >'%(args.threads)+rev_out.name]
         log = "Write input files to tmpdir using gzcat"
         run_subprocess(cmd1,args,log)
         run_subprocess(cmd2,args,log)
@@ -153,6 +165,8 @@ def merge_reads(args):
 
 def remove_methylation(in_files,args):
     """Remove methylation in watson and crick using sed"""
+    #make deepcopy to prevent
+    dict_out = copy.deepcopy(in_files)
     for strand in ['watson','crick']:
         for key,value in in_files[strand].items():
             name_out = key + "_demethylated"
@@ -160,14 +174,14 @@ def remove_methylation(in_files,args):
             file_out += '.gz'
             if strand == 'watson':
                 #sed only replaces values in lines that only contain valid nucleotides
-                cmd = ["sed '/^[A,C,G,T,N]*$/s/C/T/g' "+value + "| pigz -c >"+file_out]
+                cmd = ["sed '/^[A,C,G,T,N]*$/s/C/T/g' "+value + "| pigz -p %s -c >"%(args.threads)+file_out]
             else:
                 #sed only replaces values in lines that only contain valid nucleotides
-                cmd = ["sed '/^[A,C,G,T,N]*$/s/G/A/g' "+value + "| pigz -c >"+file_out]
+                cmd = ["sed '/^[A,C,G,T,N]*$/s/G/A/g' "+value + "| pigz -p %s -c >"%(args.threads)+file_out]
             log = "use sed to remove methylation variation in %s_%s"%(strand,key)
             run_subprocess(cmd,args,log)
-            in_files[strand][name_out] = file_out
-    return in_files
+            dict_out[strand][name_out] = file_out
+    return dict_out
 
 def reverse_complement(read):
     """fast reverse complement"""
@@ -177,38 +191,49 @@ def reverse_complement(read):
 
 def join_fastq(r1,r2,outfile,args):
     """join fastq files with 'NNNN' between forward and reverse complemented reverse read"""
-    cmd = ["paste <(pigz -cd %s |seqtk seq -A -) "%(r1) +
-           "<(pigz -cd %s |seqtk seq -A -)|cut -f1-5|sed '/^>/!s/\t/NNNNNNNN/g' |pigz -c > %s"%(r2,outfile)]
-    log = "Combine joined fastq file"
+    #get max length of forward and reverse barcodes
+    if args.barcodes:
+        with open(args.barcodes) as bc_handle:
+            header = bc_handle.readline()[:-1].split('\t')
+            barcode_1_index = header.index('Barcode_R1')
+            barcode_2_index = header.index('Barcode_R2')
+            try:
+                wobble_R1_index = header.index('Wobble_R1')
+                wobble_R2_index = header.index('Wobble_R2')
+            except ValueError:
+                wobble_R1_index = None
+                wobble_R2_index = None
+            barcode_1_max_len = 0
+            barcode_2_max_len = 0
+            for line in bc_handle:
+                if line == '\n':
+                   continue
+                split_line = line.rstrip('\n').split('\t')
+                try:
+                    #TODO: make control nucleotide explicit option in barcode file, now harccoded!
+                    wobble_R1_len = int(split_line[wobble_R1_index]) + 1
+                    wobble_R2_len = int(split_line[wobble_R2_index]) + 1
+                except TypeError:
+                    wobble_R1_len = 0
+                    wobble_R2_len = 0
+                if len(split_line[barcode_1_index]) > barcode_1_max_len:
+                    barcode_1_max_len = len(split_line[barcode_1_index])
+                if len(split_line[barcode_2_index]) > barcode_2_max_len:
+                    barcode_2_max_len = len(split_line[barcode_2_index])
+        max_len_R1 = int(args.cycles) - barcode_1_max_len - wobble_R1_len
+        max_len_R2 = int(args.cycles) - barcode_2_max_len - wobble_R2_len
+    else:
+        #no trimming required
+        max_len_R1 = 200
+        max_len_R2 = 200
+    # Trim the reads up to the min expected length to improve de novo reference creation for joined reads
+    # R2 needs to be trimmed in the same way, first make reverse complement (with seqtk -rA),
+    # afterwards, trim the sequence to the desired length, afterwards make reverse complement again (seqtk -r).
+    cmd = ["paste <(seqtk seq -A %s | cut -c1-%s) " % (r1, max_len_R1) +
+           "<(seqtk seq  -rA %s |cut -c1-%s|seqtk seq -r -) |cut -f1-5" % (r2, max_len_R2) +
+           "|sed '/^>/!s/\t/NNNNNNNN/g' |pigz -p %s -c > %s" % (args.threads, outfile)]
+    log = "Combine joined fastq file into single fasta file"
     run_subprocess(cmd,args,log)
-    # if r1.endswith('gz'):
-    #     f1_handle = gzip.open(r1)
-    #     f2_handle = gzip.open(r2)
-    # else:
-    #     f1_handle = open(r1)
-    #     f2_handle = open(r2)
-    # if outfile.endswith('gz'):
-    #     out_handle = gzip.open(outfile,'w')
-    # else:
-    #     out_handle = open(outfile,'w')
-    # while True:
-    #     read1 = []
-    #     read2 = []
-    #     try:
-    #         for i in range(4):
-    #             read1.append(f1_handle.next())
-    #             read2.append(f2_handle.next())
-    #     except StopIteration:
-    #         break
-    #     out = '>%s\n%s'%(read1[0][1:-1],read1[1][:-1])
-    #     #add N nucleotides to read s1
-    #     out += 'N'*8
-    #     #add reverse complement of read 2 to read 1
-    #     #TODO: check if output file is correct in terms of strandedness
-    #     out += read2[1][:-1]
-    #     out += '\n'
-    #     out_handle.write(out)
-    # out_handle.close()
     return True
 
 def join_non_overlapping(in_files,args):
@@ -227,69 +252,68 @@ def join_non_overlapping(in_files,args):
 def trim_and_zip(in_files,args):
     """Trim fastq files and return using pigz"""
     in_files['trimmed'] = {}
-    #Process single files
-    #TODO: determine number of nucleotide trimmed from reads dependent on restriction enzyme being used.
-    log = 'Process single watson reads: Trim first %s bases of R1'%'3'
+
+    log = 'Zip single watson reads: '
     file_in = in_files['watson']['single_R1']
     if args.outputdir:
-        file_out = os.path.join(args.outputdir, 'Unassembled.R1.watson_trimmed.fq.gz')
+        file_out = os.path.join(args.outputdir, 'Unassembled.R1.watson.fq.gz')
     else:
-        file_out = '_'.join(args.watson_forward.split('_')[:-1])+'.unassembled.watson.R1.trimmed.fq.gz'
+        file_out = '_'.join(args.watson_forward.split('_')[:-1])+'.Unassembled.watson.R1.fq.gz'
     in_files['trimmed']['watson_R1'] = file_out
-    cmd = [seqtk + ' trimfq -b 4 %s |pigz -c > %s'%(file_in,file_out)]
+    cmd = [seqtk + ' seq %s |pigz -p %s -c > %s'%(file_in, args.threads, file_out)]
     run_subprocess(cmd,args,log)
 
-    log = 'Process single watson reads: reverse complement but no trimming required for R2 '
+    log = 'Process single watson reads: reverse complement required for R2 '
     file_in = in_files['watson']['single_R2']
     if args.outputdir:
-        file_out = os.path.join(args.outputdir, 'Unassembled.R2.crick_trimmed.fq.gz')
+        file_out = os.path.join(args.outputdir, 'Unassembled.R2.crick.fq.gz')
     else:
-        file_out = '_'.join(args.watson_reverse.split('_')[:-1])+'.unassembled.watson.R2.fq.gz'
+        file_out = '_'.join(args.watson_reverse.split('_')[:-1])+'.Unassembled.watson.R2.fq.gz'
     in_files['trimmed']['watson_R2'] = file_out
     #Take reverse complement as pear outputs R2 in reverse complement
-    cmd = [seqtk + ' seq %s |%s seq -r - |pigz -c > %s'%(file_in,seqtk,file_out)]
+    cmd = [seqtk + ' seq -r %s |pigz -p %s -c > %s'%(file_in, args.threads, file_out)]
     run_subprocess(cmd,args,log)
 
     log = 'Process single crick reads: no trimming required for R1'
     file_in = in_files['crick']['single_R1']
     if args.outputdir:
-        file_out = os.path.join(args.outputdir, 'Unassembled.R1.watson_trimmed.fq.gz')
+        file_out = os.path.join(args.outputdir, 'Unassembled.R1.watson.fq.gz')
     else:
-        file_out = '_'.join(args.crick_forward.split('_')[:-1])+'.unassembled.crick.R1.fq.gz'
+        file_out = '_'.join(args.crick_forward.split('_')[:-1])+'.Unassembled.crick.R1.fq.gz'
     in_files['trimmed']['crick_R1'] = file_out
-    cmd = [seqtk + ' seq %s |pigz -c >> %s'%(file_in,file_out)]
+    cmd = [seqtk + ' seq %s |pigz -p %s -c >> %s'%(file_in, args.threads, file_out)]
     run_subprocess(cmd,args,log)
 
-    log = 'Process single crick reads: reverse complement an trim first 4 of R2'
+    log = 'Process single crick reads: reverse complement for R2'
     file_in = in_files['crick']['single_R2']
     if args.outputdir:
-        file_out = os.path.join(args.outputdir, 'Unassembled.R2.crick_trimmed.fq.gz')
+        file_out = os.path.join(args.outputdir, 'Unassembled.R2.crick.fq.gz')
     else:
-        file_out = '_'.join(args.crick_reverse.split('_')[:-1])+'.unassembled.crick.R2.trimmed.fq.gz'
+        file_out = '_'.join(args.crick_reverse.split('_')[:-1])+'.Unassembled.crick.R2.fq.gz'
     in_files['trimmed']['crick_R2'] = file_out
     #Take reverse complement as pear outputs R2 in reverse complement
-    cmd = [seqtk + ' trimfq -e 4 %s |%s seq -r - |pigz -c >> %s'%(file_in,seqtk,file_out)]
+    cmd = [seqtk + ' seq -r %s |pigz -p %s -c >> %s'%(file_in, args.threads, file_out)]
     run_subprocess(cmd,args,log)
 
     #Process merged files
-    log = 'Process merged watson reads: Trim first 4 bases of R1'
+    log = 'Process merged watson reads:'
     file_in = in_files['watson']['merged']
     if args.outputdir:
-        file_out = os.path.join(args.outputdir, 'Assembled.trimmed.fq.gz')
+        file_out = os.path.join(args.outputdir, 'Assembled.fq.gz')
     else:
-        file_out = '_'.join(args.watson_forward.split('_')[:-1])+'.assembled.watson.trimmedR1.fq.gz'
+        file_out = '_'.join(args.watson_forward.split('_')[:-1])+'.Assembled.R1.fq.gz'
     in_files['trimmed']['watson_merged'] = file_out
-    cmd = [seqtk + ' trimfq -b 4 %s |pigz -c > %s'%(file_in,file_out)]
+    cmd = [seqtk + ' seq %s |pigz -p %s -c > %s'%(file_in, args.threads, file_out)]
     run_subprocess(cmd,args,log)
 
-    log = 'Process merged crick reads: Trim first 4 bases of R2'
+    log = 'Process merged crick reads:'
     file_in = in_files['crick']['merged']
     if args.outputdir:
-        file_out = os.path.join(args.outputdir, 'Assembled.trimmed.fq.gz')
+        file_out = os.path.join(args.outputdir, 'Assembled.fq.gz')
     else:
-        file_out = '_'.join(args.crick_forward.split('_')[:-1])+'.assembled.crick.trimmedR2.fq.gz'
+        file_out = '_'.join(args.crick_forward.split('_')[:-1])+'.Assembled.fq.gz'
     in_files['trimmed']['crick_merged'] = file_out
-    cmd = [seqtk + ' trimfq -e 4 %s |pigz -c >> %s'%(file_in,file_out)]
+    cmd = [seqtk + ' seq %s |pigz -p %s -c >> %s'%(file_in, args.threads, file_out)]
     run_subprocess(cmd,args,log)
 
     return in_files
@@ -303,7 +327,7 @@ def dereplicate_reads(in_files,args):
             file_in = in_files[strand][name]
             file_out = '.'.join(file_in.split('.')[:-2]) + '.derep.' + file_in.split('.')[-2]
             in_files[strand][name] = [file_in]
-            cmd = [vsearch +' -derep_fulllength %s -sizeout -minuniquesize 2 -output %s'%(file_in,file_out)]
+            cmd = [vsearch +' -derep_fulllength %s -sizeout -output %s'%(file_in,file_out)]
             log = "Dereplicate full_length of %s using vsearch"%(strand)
             run_subprocess(cmd,args,log)
             name_out = name + "_derep"
@@ -420,6 +444,13 @@ def get_ref(clusters):
             crick_nt = max(output_count[i]['c'].iteritems(), key=operator.itemgetter(1))[0]
         except KeyError:
             return None
+        except AttributeError:
+            #occurs in python3, there we should use items and not iteritems
+            try:
+                watson_nt = max(output_count[i]['w'].items(), key=operator.itemgetter(1))[0]
+                crick_nt = max(output_count[i]['c'].items(), key=operator.itemgetter(1))[0]
+            except KeyError:
+                return None
         if watson_nt == crick_nt:
             output_fasta += watson_nt
         elif watson_nt == 'G' and crick_nt == 'A':
@@ -433,6 +464,7 @@ def get_ref(clusters):
         else:
             output_fasta += 'N'
     output_fasta += '\n'
+    return output_fasta
     return output_fasta
 
 
@@ -474,7 +506,8 @@ def make_ref_from_uc(in_files,args):
 
 def cluster_consensus(in_files,args):
     "Cluster concensus with preset id"
-    cmd = [vsearch+" -cluster_smallmem %s -id 0.95 -centroids %s -sizeout -strand both"%
+    #TODO: vsearch ignores joined sequences, temporarily revert back to vsearch to prevent this from happening.
+    cmd = [vsearch + " -qmask none -cluster_smallmem %s -id 0.95 -centroids %s -sizeout -strand both"%
            (args.consensus,
             args.consensus_cluster)]
     log = "Clustering consensus with 95% identity"
@@ -484,11 +517,36 @@ def cluster_consensus(in_files,args):
     cluster_renamed = args.consensus_cluster.replace('.fa','.renamed.fa')
     cmd = ['cat %s | rename_fast.py -n > %s'%(args.consensus_cluster, cluster_renamed)]
     run_subprocess(cmd,args,log)
+    log = "faidx index %s" % cluster_renamed
+    cmd = ["samtools faidx %s" % cluster_renamed]
+    run_subprocess(cmd, args, log)
     return in_files
 
 def check_dependencies():
     """check for presence of dependencies and if not present say where they can be installed"""
 
+    return 0
+
+def add_numbers(a,b):
+    """"return sum of a and b"""
+
+
+
+def clear_tmp(file_dict):
+    """clear tmp files"""
+    purge_list = []
+    for v in file_dict.keys():
+        for key,value in file_dict[v].items():
+            try:
+                #TODO: fix error when running from tmp as input folderGq
+                if value.startswith('/tmp'):
+                    purge_list.append(value)
+            except AttributeError:
+                if type(value) == type([]):
+                    purge_list.append(value[0])
+    for item in purge_list:
+        print("removing %s" % item)
+        # os.remove(item)
     return 0
 
 
@@ -520,5 +578,8 @@ def main():
     files = make_ref_from_uc(files,args)
     #step 8: Cluster consensus
     files = cluster_consensus(files,args)
+    # step 8: Clean tmp files
+    files = clear_tmp(files)
+
 if __name__ == '__main__':
     main()

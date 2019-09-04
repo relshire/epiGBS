@@ -48,12 +48,12 @@ def main():
         check_file_formats.check_fasta(args.fasta)
         check_file_formats.check_bed(args.bed)
         check_file_formats.check_sample_file(args.sample_file)
-        # Prepare analysis files
-        if args.bed:
-            prepare_bed_analysis(args)
         # Coverts given .Fasta file to a 2bit file and writes it to the /tmp/ directory.
         twobit_file = fasta_to_2bit(args)
         tmp_files.append(twobit_file)
+        # Prepare analysis files
+        if args.bed:
+            prepare_bed_analysis(args)
         # Makes description file out of the species and genus information given by the argparse arguments and
         # writes it to the /tmp/ directory.
         description = make_rnbeads_description(twobit_file, args)
@@ -120,19 +120,22 @@ def run_subprocess(cmd, log_message):
     """
     sys.stdout.write("now starting:\t%s\n\n" % log_message)
     sys.stdout.write('running:\t%s\n\n' % cmd)
+    if type(cmd) != type([]):
+        cmd = [cmd]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, executable='/bin/bash')
-    exit_code = p.wait()
-    stdout = p.stdout.read().replace('\r', '\n')
-    stderr = p.stderr.read().replace('\r', '\n')
+    stdout, stderr = p.communicate()
+    exit_code = p.returncode
+    stdout = stdout.replace('\r', '\n')
+    stderr = stderr.replace('\r', '\n')
     if stdout:
         sys.stdout.write('stdout:\n%s\n' % stdout)
     if stderr:
-        sys.stdout.write('stderr:\n%s\n' % stderr)
+        if 'Execution halted' in stderr or exit_code != 0:
+            raise Exception('R script returned error\n%s' % stderr)
+        else:
+            sys.stdout.write('stderr:\n%s\n' % stderr)
     sys.stdout.write('finished:\t%s\n\n' % log_message)
-    if exit_code:
-        return Exception("Call of %s failed with \n %s" % (cmd, stderr))
-    else:
-        return 0
+    return 0
 
 
 def compress_folder(args, cur_time):
@@ -182,13 +185,9 @@ def prepare_bed_analysis(args):
     input_file, output_dict, samples = prepare_analysis.ParseFiles(args.bed, output_dir)  # Make all .bed files
     # Fill all .bed files with formatted info.
 
-    if args.chg:
-        type = "CHG"
-    else:
-        type = "CG"
-
-    invalid_samples = prepare_analysis.IgvToRnBeads(input_file, output_dict, samples, output_dir, given_samples,
-                                                    args.minimal_reads, type)
+    seq_handle = SeqIO.parse(open(args.fasta),'fasta')
+    invalid_samples = prepare_analysis.IgvToRnBeads(input_file,seq_handle, output_dict, samples, output_dir, given_samples,
+                                                    args.minimal_reads, args.context)
 
     # If there are invalid samples (that have less than 5% of the reads of the maximum sample`s reads), Then
     # there will be a new samples file created with these filtered out.
@@ -216,7 +215,7 @@ def run_analysis(args):
     Analysis function for the R RnBeads package. Prepares the template .R script run.analysis.
     After the analysis, the output folder will be zipped in a given directory.
     """
-    cur_time = time.strftime("%d_%m_%Y_%H:%M")
+    cur_time = time.strftime("%d_%m_%Y_%H_%M")
     if not args.script_dir:
         script_dir = os.path.dirname(os.path.realpath(__file__))
         script_dir = script_dir.replace(' ', '\ ')
@@ -498,7 +497,7 @@ def forge_genome_file(description, args):
     forge_r_script.write(adjusted_forge_template)
     forge_r_script.close()
     # Makes from the description file, a folder which can be build and installed via bash.
-    command = "R < "+forge_r_script.name+" --no-save"
+    command = "R < "+forge_r_script.name + " --no-save"
     log_message = "Forging genome file"
     run_subprocess(command, log_message)  # Runs the appended template script.
     return forge_r_script.name
@@ -531,46 +530,84 @@ def make_rnbeads_description(twobit_file, args):
     return description
 
 
-def convert_fasta(args):
+def convert_fasta_bed(args):
     unconverted_fasta = SeqIO.parse(open(args.fasta), 'fasta')
-    output_fasta = os.path.join(args.temp_directory, "chg.fasta")
+    unconverted_bed = open(args.bed,'r')
+    output_fasta = os.path.join(args.temp_directory, "output.fasta")
+    output_bed = os.path.join(args.temp_directory, "output.bed")
+    output_bed_handle = open(output_bed,'w')
+    #write header to new bed file
+    output_bed_handle.write(unconverted_bed.readline())
     with open(output_fasta, "w") as converted_fasta:
         for record in unconverted_fasta:
             sequence = list(record.seq)
             converted_sequence = str()
-            # sequence = str(record.seq)
-            for i, nucleotide in enumerate(sequence):
-                converted_sequence += str(sequence[i])
-                seq_window = sequence[i:i+3]
-                if "C" in seq_window and "G" in seq_window:
-                    if len(seq_window) == 3:
-                        if seq_window[0:2] == ["C", "G"]:
-                            if seq_window[2] == "G":
-                                converted_sequence += "CG"
-                                del sequence[i]
-                                del sequence[+1]
-                            else:
-                                sequence.insert(i+1, "A")
-                        elif seq_window[0] == "C" and seq_window[2] == "G":
-                            del sequence[i+1]
-                    elif len(seq_window) == 2:
-                        if seq_window == ["C", "G"]:
-                            sequence.insert(i+1, "A")
-
-            record.seq = Seq.Seq(converted_sequence, generic_dna)
+            sequence = str(record.seq)
+            #initiate dictionary to keep track of new nucleotide positions
+            pos_convert = {}
+            if args.context != 'CG':
+                sequence = sequence.replace('CG','XY')
+            i = 0
+            while True:
+                if len(sequence[i:]) < 3:
+                    break
+                if args.context == 'CHG':
+                    if sequence[i] in 'CX' and sequence[i+2] in 'GY':
+                        if sequence[i] != 'X':
+                            pos_convert[i + 1 ] = len(converted_sequence) + 1
+                            converted_sequence += 'CG'
+                        if sequence[i + 2] != 'Y':
+                            pos_convert[i + 3] = len(converted_sequence) + 1
+                            converted_sequence += 'CG'
+                    else:
+                        converted_sequence += sequence[i]
+                elif args.context == 'CG':
+                    if sequence[i:i+2]  == 'CG':
+                        pos_convert[i + 1] = len(converted_sequence) + 1
+                        converted_sequence += 'CG'
+                        pos_convert[i + 2] = len(converted_sequence) + 1
+                        converted_sequence += 'CG'
+                    else:
+                        converted_sequence += sequence[i]
+                elif args.context == 'CHH':
+                    if sequence[i:i + 2] == 'CG' or (sequence[i] in 'CX' and sequence[i+2] in 'GY'):
+                        converted_sequence += sequence[i]
+                    elif sequence[i] == 'C' and sequence[i+1] not in ['GY'] and sequence[i+2] not in ['GY']:
+                        pos_convert[i + 1] = len(converted_sequence) + 1
+                        converted_sequence += 'CG'
+                    elif sequence[i] not in 'CX'  and sequence[i + 1] not in ['CX'] and sequence[i + 2] == 'G':
+                        pos_convert[i + 3] = len(converted_sequence) + 1
+                        converted_sequence += 'CG'
+                        i += 2
+                    else:
+                        converted_sequence += sequence[i]
+                i+=1
+            while True:
+                pos = unconverted_bed.tell()
+                line = unconverted_bed.readline()
+                split_line = line.split('\t')
+                if split_line[0] == record.id:
+                    if int(split_line[1]) in pos_convert:
+                        if split_line[2] == args.context:
+                            split_line[1] = str(pos_convert[int(split_line[1])])
+                            output_bed_handle.write('\t'.join(split_line))
+                else:
+                    unconverted_bed.seek(pos)
+                    break
+            record.seq = Seq.Seq(converted_sequence.replace('XY','NN'), generic_dna)
             SeqIO.write(record, converted_fasta, "fasta")
-
-    return converted_fasta.name
-
+    output_bed_handle.close()
+    args.bed = output_bed
+    args.fasta = output_fasta
+    return args
 
 def fasta_to_2bit(args):
     """
     Coverts the given fasta to a .2bit file via the faToTwoBit executable.
     """
-    if args.chg:
-        fasta = convert_fasta(args)
-    else:
-        fasta = args.fasta
+
+    args = convert_fasta_bed(args)
+
 
     # Source for fat2bit for mac osx is here: http://hgdownload.cse.ucsc.edu/admin/exe/macOSX.x86_64/
     sys.stdout.write("""Adding the genome of %s to the RnBeads package\n
@@ -586,15 +623,15 @@ def fasta_to_2bit(args):
         tool_name = "faToTwoBit_linux"
     else:
         tool_name = "faToTwoBit_mac"
-    twobit_name = os.path.basename(os.path.splitext(fasta)[0])+'.2bit'
+    twobit_name = os.path.basename(os.path.splitext(args.fasta)[0])+'.2bit'
     twobit_file = os.path.join(args.temp_directory, twobit_name)
     # Writes the fasta to a twobit file in the tmp folder and is deleted after the analysis.
     log_message = "Converts the given fasta to a .2bit file"
 
     if platform.system() == 'Linux':
-        command = " ".join([os.path.join(script_dir, "templates/" + tool_name), fasta, twobit_file])
+        command = " ".join([os.path.join(script_dir, "templates/" + tool_name), args.fasta, twobit_file])
     else:
-        command = " ".join([os.path.join(script_dir, "templates/" + tool_name), fasta, twobit_file])
+        command = " ".join([os.path.join(script_dir, "templates/" + tool_name), args.fasta, twobit_file])
 
     run_subprocess(command, log_message)
     return twobit_file
@@ -612,7 +649,7 @@ def parse_args():
     # If chosen: only the run_analysis function will be executed.
     analysis_only = subparsers.add_parser('analysis_only', help="""If assembly and genome already added:
     analysis only is possible.""")
-    analysis_only.add_argument('-c', '--cores', help='Number of cores you want to use for the analysis', default="2")
+    analysis_only.add_argument('-c', '--cores', help='Number of cores you want to use for the analysis', default="4")
     analysis_only.add_argument('-a', '--annotation', default=None, nargs="*",
                                help="""Annotation file(s) to be added for the annotation (optional).
                                Extra files can be added by separating them with a whitespace.
@@ -626,8 +663,7 @@ def parse_args():
                                                               package""")
     analysis_only.add_argument('-lp', '--lib_path', help='Library installation folder for R packages.', default="c()")
     analysis_only.add_argument('-o', '--output', help='Output file (needed for galaxy)', default=None)
-    analysis_only.add_argument('-chg', '--chg', help='If used, RnBeads will analyse ChG methlylation instead of CG"; ',
-                               default=None, action='store_true')
+    analysis_only.add_argument('-co', '--context', help='Context to analyze', default='CG')
 
     # If chosen all the main functions will be executed.
     add_and_analysis = subparsers.add_parser('add_and_analysis', help="""Add genome and assembly AND analyse it
@@ -655,8 +691,7 @@ def parse_args():
     add_and_analysis.add_argument('-mr', '--minimal_reads', help='Number of minimal reads per sample on one CpG site',
                                   default=5)
     add_and_analysis.add_argument('-sd', '--script_dir', help='directory of script')
-    add_and_analysis.add_argument('-chg', '--chg', help='If used, RnBeads will analyse ChG methlylation instead of CG"; ',
-                                  default=None, action='store_true')
+    add_and_analysis.add_argument('-co', '--context', help='Context to analyze',default='CG')
 
     # If chosen: every main function fill be executed except for the run_analysis function.
     add_only = subparsers.add_parser('add_only', help="Only add the genome and assembly to the RnBeads package.")
@@ -671,10 +706,11 @@ def parse_args():
     add_only.add_argument('-lp', '--lib_path', help='Library installation folder for R packages.', default="c()")
     add_only.add_argument('-mr', '--minimal_reads', help='Number of minimal reads per sample on one CpG site',
                           default=5)
-    add_only.add_argument('-chg', '--chg', help='If used, RnBeads will analyse ChG methlylation instead of CG"; ', default=None,
-                          action='store_true')
+    add_only.add_argument('-co', '--context', help='Context to analyze',default='CG')
     # Parses the arguments to the args variable.
     args = parser.parse_args()
+    #Rnbeads removes capitals from assembly_code name, convert to lower chars.
+    args.assembly_code = args.assembly_code.lower()
     return args
 
 
